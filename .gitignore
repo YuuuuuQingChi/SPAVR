@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Env / tooling
+.venv/
+.env
+
+# Data & artifacts (kept out of the repo)
+*.pkl
+*.ckpt
+*.pth
+data/
+outputs/
+checkpoints/
+wandb/
+
+# OS / editor cruft
+.DS_Store

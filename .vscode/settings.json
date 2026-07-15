@@ -1,0 +1,13 @@
+{
+  "python.defaultInterpreterPath": "/data7/yuqingchi/miniconda3/envs/cjepa/bin/python",
+  "python.analysis.extraPaths": [
+    "third_party/cjepa",
+    "third_party/cjepa/src/third_party/stable-pretraining",
+    "third_party/cjepa/src/third_party/stable-worldmodel"
+  ],
+  "python.analysis.include": [
+    "spavr",
+    "train",
+    "third_party/cjepa/src"
+  ]
+}
