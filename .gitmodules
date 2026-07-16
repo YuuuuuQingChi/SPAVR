@@ -1,0 +1,3 @@
+[submodule "third_party/cjepa"]
+	path = third_party/cjepa
+	url = https://github.com/YuuuuuQingChi/cjepa.git
