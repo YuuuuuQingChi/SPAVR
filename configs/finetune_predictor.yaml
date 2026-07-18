@@ -1,0 +1,42 @@
+seed: 42
+cjepa_model_object: null
+output_dir: outputs/finetune_predictor
+output_name: spavr-finetune-predictor
+
+model:
+  history_size: 5
+  predicted_size: 3
+  num_objects: 4
+  slot_dim: 128
+  action_dim: 2
+  proprio_dim: 4
+  frameskip: 3
+  num_masked_slots: 2
+  hidden_dim: 256
+  taus: [0.1, 0.5, 0.9]
+
+data:
+  embedding_dir: null
+  action_dir: null
+  proprio_dir: null
+  state_dir: null
+  batch_size: 256
+  num_workers: 10
+  pin_memory: true
+
+loss:
+  anchor_weight: 0.1
+
+optim:
+  head_lr: 5.0e-4
+  dynamics_lr: 5.0e-5
+  weight_decay: 1.0e-4
+  scheduler: CosineAnnealingLR
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: 32-true
+  max_epochs: 30
+  log_every_n_steps: 10
+  num_sanity_val_steps: 1

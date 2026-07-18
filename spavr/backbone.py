@@ -1,19 +1,40 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import AutoModel
 
-import stable_worldmodel as swm
-from src.cjepa_predictor import MaskedSlot_AP_Predictor
-from src.world_models.dinowm_causal_AP_node import CausalWM_AP
+from third_party.cjepa.src.cjepa_predictor import MaskedSlot_AP_Predictor
+from third_party.cjepa.src.third_party.videosaur.videosaur.modules.encoders import (
+    FrameEncoder,
+)
+from third_party.cjepa.src.third_party.videosaur.videosaur.modules.groupers import (
+    SlotAttention,
+)
+from third_party.cjepa.src.third_party.videosaur.videosaur.modules.initializers import (
+    RandomInit,
+)
+from third_party.cjepa.src.third_party.videosaur.videosaur.modules.networks import (
+    MLP,
+    TransformerEncoder,
+)
+from third_party.cjepa.src.third_party.videosaur.videosaur.modules.video import (
+    LatentProcessor,
+    MapOverTime,
+    ScanOverTime,
+)
+from third_party.cjepa.src.world_models.dinowm_causal_AP_node import (
+    CausalWM_AP,
+    Embedder,
+)
 
 
 class CJepaBackbone(nn.Module):
     def __init__(
         self,
-        num_objects=4,        # S: number of object slots (PushT)
-        slot_dim=128,         # D
+        num_objects=4,  # S: number of object slots (PushT)
+        slot_dim=128,  # D
         history_size=5,
-        num_preds=3,
+        predicted_size=3,
         action_dim=2,
         proprio_dim=4,
         frameskip=3,
@@ -27,16 +48,17 @@ class CJepaBackbone(nn.Module):
     ):
         super().__init__()
         self.history_size = history_size
-        self.num_preds = num_preds
-        self.num_objects = num_objects                # S
-        self.num_slots = num_objects + 2              # S + 2 (objects + proprio + action)
-        self.slot_dim = slot_dim                      # D
+        self.predicted_size = predicted_size
+        self.action_input_dim = frameskip * action_dim
+        self.num_objects = num_objects  # S
+        self.num_slots = num_objects + 2  # S + 2 (objects + proprio + action)
+        self.slot_dim = slot_dim  # D
 
         predictor = MaskedSlot_AP_Predictor(
             num_slots=self.num_slots,
             slot_dim=slot_dim,
             history_frames=history_size,
-            pred_frames=num_preds,
+            pred_frames=predicted_size,
             num_masked_slots=num_masked_slots,
             seed=seed,
             depth=depth,
@@ -45,51 +67,117 @@ class CJepaBackbone(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
         )
-        action_encoder = swm.wm.dinowm.Embedder(in_chans=frameskip * action_dim, emb_dim=slot_dim)
-        proprio_encoder = swm.wm.dinowm.Embedder(in_chans=proprio_dim, emb_dim=slot_dim)
-
-        # CausalWM_AP only consumes slots on this path; the visual front-end lives in model.py.
-        self.world_model = CausalWM_AP(
-            encoder=None,
-            slot_attention=None,
-            initializer=None,
-            predictor=predictor,
-            action_encoder=action_encoder,
-            proprio_encoder=proprio_encoder,
-            history_size=self.history_size,
-            num_pred=self.num_preds,
+        encoder = MapOverTime(
+            FrameEncoder(
+                backbone=AutoModel.from_pretrained("facebook/dinov2-small"),
+                output_transform=MLP(
+                    inp_dim=384,
+                    outp_dim=slot_dim,
+                    hidden_dims=[768],
+                    initial_layer_norm=True,
+                ),
+            )
+        )
+        initializer = RandomInit(n_slots=num_objects, dim=slot_dim)
+        processor = ScanOverTime(
+            LatentProcessor(
+                corrector=SlotAttention(
+                    inp_dim=slot_dim,
+                    slot_dim=slot_dim,
+                    n_iters=2,
+                    use_mlp=False,
+                ),
+                predictor=TransformerEncoder(
+                    dim=slot_dim,
+                    n_blocks=1,
+                    n_heads=4,
+                ),
+                first_step_corrector_args={"n_iters": 3},
+            )
         )
 
-    def build_embedding(self, slots, action, proprio):
-    
-        wm = self.world_model
-        proprio_slot = wm.proprio_encoder(proprio.float()).unsqueeze(2)
-        action_slot = wm.action_encoder(action.float()).unsqueeze(2)
-        return torch.cat([slots, proprio_slot, action_slot], dim=2)
+        self.world_model = CausalWM_AP(
+            encoder=encoder,
+            slot_attention=processor,
+            initializer=initializer,
+            predictor=predictor,
+            action_encoder=Embedder(
+                in_chans=self.action_input_dim,
+                emb_dim=slot_dim,
+            ),
+            proprio_encoder=Embedder(in_chans=proprio_dim, emb_dim=slot_dim),
+            history_size=self.history_size,
+            num_pred=self.predicted_size,
+        )
 
-    def forward_repr(self, slots, action, proprio):
-        history = self.build_embedding(slots, action, proprio)[:, :self.history_size]
+    def encode_inputs(self, batch, num_steps):
+        """Build C-JEPA embeddings from raw pixels or pre-extracted object slots."""
+        actions = batch["action"][:, :num_steps]
+        proprio = batch["proprio"][:, :num_steps]
+
+        if "pixels_embed" in batch:
+            object_slots = batch["pixels_embed"][:, :num_steps].float()
+            proprio_slots = self.world_model.proprio_encoder(proprio.float()).unsqueeze(
+                2
+            )
+            action_slots = self.world_model.action_encoder(actions.float()).unsqueeze(2)
+            return torch.cat([object_slots, proprio_slots, action_slots], dim=2)
+
+        info = self.world_model.encode(
+            {
+                "pixels": batch["pixels"][:, :num_steps],
+                "action": actions,
+                "proprio": proprio,
+            },
+            pixels_key="pixels",
+            proprio_key="proprio",
+            action_key="action",
+            target="embed",
+        )
+        return info["embed"]
+
+    def forward(self, x):
+        """Use ceil((L-H)/P)+1 predictor calls and return P final frames."""
+        h, p = self.history_size, self.predicted_size
+        actions = x["action"]
+        history = self.encode_inputs(x, h)
+
         predictor = self.world_model.predictor
-        saved = predictor.num_masked_slots
+        saved_num_masked_slots = predictor.num_masked_slots
         predictor.num_masked_slots = 0
         try:
-            out, _ = predictor(history)
+            current_step = h
+            while current_step < actions.shape[1]:
+                future = self.world_model.predict(history)[0][:, h : h + p]
+                steps_this_round = min(p, actions.shape[1] - current_step)
+                future = self.world_model.replace_action_in_embedding(
+                    future[:, :steps_this_round].unsqueeze(1),
+                    actions[
+                        :, current_step : current_step + steps_this_round
+                    ].unsqueeze(1),
+                ).squeeze(1)
+                history = torch.cat([history, future], dim=1)[:, -h:]
+                current_step += steps_this_round
+
+            future = self.world_model.predict(history)[0][:, h : h + p]
         finally:
-            predictor.num_masked_slots = saved
-        return out[:, self.history_size - 1]
+            predictor.num_masked_slots = saved_num_masked_slots
+        return future
 
-    def anchor_loss(self, slots, action, proprio):
-      
-        embedding = self.build_embedding(slots, action, proprio)
-        h, p, s = self.history_size, self.num_preds, self.num_objects
+    def anchor_loss(self, batch):
+        """Compute the masked-history and future-state anchor loss."""
+        h, p, s = self.history_size, self.predicted_size, self.num_objects
+        embedding = self.encode_inputs(batch, h + p)
         history = embedding[:, :h]
-        target = embedding[:, h:h + p].detach()
+        target = embedding[:, h : h + p].detach()
 
-        pred, mask_indices = self.world_model.predictor(history)
+        pred, mask_indices = self.world_model.predict(history)
         pred_history = pred[:, :h]
-        pred_future = pred[:, h:h + p]
+        pred_future = pred[:, h : h + p]
 
-        loss = F.mse_loss(pred_history[:, :, mask_indices], history[:, :, mask_indices].detach())
+        loss = F.mse_loss(
+            pred_history[:, :, mask_indices], history[:, :, mask_indices].detach()
+        )
         loss = loss + F.mse_loss(pred_future[:, :, :s], target[:, :, :s])
-        loss = loss + F.mse_loss(pred_future[:, :, s:s + 1], target[:, :, s:s + 1])
+        loss = loss + F.mse_loss(pred_future[:, :, s : s + 1], target[:, :, s : s + 1])
         return loss

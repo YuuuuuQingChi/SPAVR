@@ -11,31 +11,39 @@ C-JEPA 本身已经是一个**带动作条件（AP）的对象级世界模型**�
 
 核心思路一句话：**把 C-JEPA 的 transformer 当 backbone，在它学好的对象隐空间上加一个"读数值的头"，让世界模型从"只会预测未来"升级为"预测未来 + 评价好坏 + 知道自己几斤几两"。**
 
-## AP 输入的槽结构（基于代码）
+## SPAVR 的动作条件槽结构
 
-C-JEPA 的 AP 版本，每一帧的序列由固定顺序的槽拼成（见 `train_causalwm_AP_node_pusht_slot.py:130-153`）：
+C-JEPA AP 的槽位置顺序固定为对象、proprio、action。SPAVR 保留这个位置结构，但把 action 严格定义为待执行的未来动作序列：
 
 ```
-每帧 = [ obj_1, obj_2, ..., obj_S ,  proprio ,  action ]
-        └──── 视觉对象槽 S 个 ────┘   └1 个┘    └1 个┘
-      整段形状 (B, T, S+2, D)，PushT 中 S=4 → 每帧 6 个槽
+历史输入位置 = [ obj_1, ..., obj_S, proprio, future_action ] × H
+预测未来位置 = [ obj_query_1, ..., obj_query_S, proprio_query, future_action ] × P
+
+外部 action: (B, L, A), L >= H
+模型使用:   完整 action 序列，不截断
+predictor 调用次数: ceil((L-H)/P)+1
 ```
 
 要点（都由代码确认）：
-- **proprio / action 各被一个小 encoder 编码成 1 个 D 维向量，再拼成"一个槽"**（`proprio_encoder` / `action_encoder`，即 `dinowm_causal_AP_node.py` 的 `Embedder`）。在 transformer 眼里它们就是另外两个 token。
-- **顺序写死**：proprio 在前、action 在后；`split_embedding` 也按此顺序拆回。
+- `action` 全部表示**尚未执行的未来动作**；前 H 个通过官方 `CausalWM_AP.encode(..., action_key="action")` 与 H 帧历史状态共同编码，不表示过去动作。
+- predictor 每轮通过官方 `CausalWM_AP.predict()` 生成 P 个未来位置；剩余动作每次最多取 P 个，经 `replace_action_in_embedding()` 写入对应预测位置，再随预测状态进入下一轮 history。
+- proprio 同样通过官方 `encode(..., proprio_key="proprio")` 加入，槽顺序始终是对象、proprio、action。
+- 模型消费完整长度 L 的动作序列；动作耗尽后额外预测一次完整 P 帧，作为奖励头的输入。
 - **mask 永不碰 proprio / action 槽**：`MaskedSlot_AP_Predictor.get_mask_indices` 用 `rng.choice(num_slots-2, ...)`，只在前 S 个对象槽里选，loss 也只在对象槽上算。
 
-**结论：动作与本体状态本就是序列里的槽，transformer 输出的 z 已经"见过"它们。**
+**结论：predictor 内部的未来 query 能通过 full attention 看到当前 H 帧 history 中的动作 token。后续动作在本轮预测完成后写入预测状态，并在下一轮 predictor 中生效；完整序列耗尽后额外预测的 P 帧用于奖励评分，因此所有输入动作都有通向输出的计算路径。**
 
 ## 通用结构
 
 ```
-历史帧 [obj×S, proprio, action]
-        │
-   C-JEPA transformer   ← 现成 backbone（先冻结，后可微调）
-        │
-   隐表征 z (B, T, S+2, D)
+历史像素 ─→ encoder ─→ initializer/slot-attention ─→ obj×S
+                                                     │
+历史 proprio ────────────────────────────────────────┤
+完整未来动作序列 ───────────────→ 动态 AP rollout ─────┤
+                                                     ▼
+             C-JEPA transformer
+                    │
+          z_future (B, P, S+2, D)
         │
    ┌────┴─────┐
    │          │
@@ -43,19 +51,11 @@ C-JEPA 的 AP 版本，每一帧的序列由固定顺序的槽拼成（见 `trai
  (重建槽)   (注意力池化 z → 分位数分布)
 ```
 
-**头只吃 z**：z 已包含动作 / 本体信息，头不再单独接 action / proprio。头用**注意力池化**把 S 个对象槽按重要性加权合并。
+**头只吃 z_future**：头不再单独接 action / proprio。方案 A 当前默认读取 5 个历史时间点、预测 3 个未来时间点；未来对象、proprio、action 槽的时间长度统一为 3，头把 `3×S` 个未来对象 token 一起做**注意力池化**。
 
-**要评估"某个待执行动作 a"时**，走 C-JEPA 现成机制，而非把 a 喂给头：
-1. 用 `replace_action_in_embedding`（`dinowm_causal_AP_node.py:158`）把 a 的编码填进未来帧的 action 槽；
-2. `rollout`（`:179`）预测出对应的未来 z_future；
-3. 头对 `pool(z_future)` 打分。
+**动作接口契约**：`x["action"]` 只表示尚未执行的完整未来动作序列。前 H 个交给官方 `encode`；其余动作按每轮最多 P 个交给官方 `replace_action_in_embedding` 并滚入下一轮 history。模型不截断动作，predictor 调用次数为 `ceil((L-H)/P)+1`；代码不额外编写尺寸检查。
 
-这条路径与规划用 `get_cost` / `criterion` 同源——只是把"和目标比算 cost"换成"用分位数头打分"。
-
-新头改动局部：`to_out` 已证明"在此隐空间接线性头"可行。落点主要三处：
-- `cjepa_predictor.py`：给 `MaskedSlot_AP_Predictor` 加 head。
-- `train_causalwm_AP_node_pusht_slot.py` 的 `forward`：加一项 reward/risk loss。
-- backbone 先冻结、只训头，跑通再考虑解冻微调。
+SPAVR 不修改第三方 C-JEPA：`spavr/backbone.py` 在外层复用 `CausalWM_AP`，`spavr/heads.py` 单独定义分位数头。Frozen 与 Predictor 分别由 `train/train_frozen.py + configs/frozen.yaml` 和 `train/train_finetune_predictor.py + configs/finetune_predictor.yaml` 驱动，共享的 Stable-Pretraining 逻辑位于 `train/common.py`。
 
 ## 共用数据底座（三方案的共同前提）
 
@@ -64,12 +64,12 @@ C-JEPA 的 AP 版本，每一帧的序列由固定顺序的槽拼成（见 `trai
 ```
 episode_id → {
   slots:   [T, S, D]     # 每帧 S 个视觉对象槽（预抽取）
-  action:  [T, act_dim]  # 每步原始动作（进模型时过 action_encoder → 1 个槽）
   proprio: [T, prop_dim] # 每步本体感受（进模型时过 proprio_encoder → 1 个槽）
+  action:  [T, A]        # 轨迹动作；按历史结束点切成未来动作序列
 }
 ```
 
-即仓库现有的 slot pkl + action / proprio meta，按 `episode_id` 对齐；进 transformer 后拼成每帧 `S+2` 个槽（见上文槽结构）。**三方案的差别只在于：底座之外加不加标签、数据要不要挑过。** 具体需求写在各方案下。
+slot、proprio、action 仍按 `episode_id` 对齐，但每个训练样本以历史结束点为边界：边界之前只取状态历史，边界之后只取未来 action。不得把过去 action 填进模型的 `action` 字段。
 
 
 # 第一层：核心方案（奖励-风险信号怎么定义 / 训练）
@@ -77,12 +77,12 @@ episode_id → {
 ## 方案 A —— 监督分位数头（推荐主线）
 
 - **核心**：头不输出单个数，而输出一排**分位数**（如 q10 / q50 / q90），描述回报的整个分布，而非只报均值。
-- **怎么出分**：`注意力池化(z 的对象槽) → MLP → [q10, q50, q90]`。**头只吃 z**——z 已含动作 / 本体信息，头不单独接动作。注意力池化用一个可学 query 对 S 个对象槽加权合并，聚焦关键物体（等权平均会把单个危险物按 1/S 冲淡）。一个头同时给三样 ——
+- **怎么出分**：`5 帧历史状态 + 完整未来动作序列 → CausalWM_AP 官方迭代 predict/replacement 路径 → 动作耗尽后额外预测 3 帧 → 注意力池化全部 3×S 个未来对象 token → MLP → [q10, q50, q90]`。头只吃完整动作序列传播后的未来 z。注意力池化用一个可学 query 在未来时间与对象两个维度上聚焦关键 token。一个头同时给三样 ——
   - 中位数 / 各分位平均 → 期望奖励
   - 下尾（如 q10）/ CVaR → 风险敏感价值（最坏情况，越低越危险）
   - 分布宽度（q90 − q10）→ 不确定性
   - "风险监测"就等于盯着分布的**下尾巴**。
-- **用 C-JEPA 什么**：对象隐状态 z 当特征，对历史帧的 z 打分 → 当前局面多好 / 多危险。
+- **用 C-JEPA 什么**：把 C-JEPA 预测出的未来 3 帧对象隐状态 z 当特征，对预测未来整体打分 → 当前局面后续可能有多好 / 多危险。
 - **训练信号**：分位数回归损失（quantile / pinball loss），需 reward 标签，训练目标用未来累计回报（return-to-go），顺带得到风险与不确定性。
 - **优**：一个头同时给"奖励 + 风险 + 不确定性"，最贴"风险监测"这个词，比"单值 reward + 另搞一套不确定性"干净得多。
 - **缺**：要标签；分位数交叉（quantile crossing，如 q10 > q90）需用现成小技巧处理。

@@ -17,10 +17,11 @@ class QuantileHead(nn.Module):
         )
 
     def forward(self, z):
-        """``z (B, S+2, D)`` -> monotone quantiles ``(B, K)``."""
-        objects = z[:, :self.num_objects]                          # (B, S, D)
+        """Pool future object tokens ``z (B, P, S+2, D)`` into ``(B, K)``."""
+        objects = z[:, :, :self.num_objects]                       # (B, P, S, D)
+        objects = objects.flatten(1, 2)                             # (B, P*S, D)
         scores = objects @ self.query * self.query.shape[0] ** -0.5
-        weights = F.softmax(scores, dim=1).unsqueeze(-1)           # (B, S, 1)
+        weights = F.softmax(scores, dim=1).unsqueeze(-1)           # (B, P*S, 1)
         pooled = (weights * objects).sum(dim=1)                    # (B, D)
 
         raw = self.mlp(pooled)                                     # (B, K)
