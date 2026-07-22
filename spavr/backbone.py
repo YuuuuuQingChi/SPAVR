@@ -115,8 +115,8 @@ class CJepaBackbone(nn.Module):
         actions = batch["action"][:, :num_steps]
         proprio = batch["proprio"][:, :num_steps]
 
-        if "pixels_embed" in batch:
-            object_slots = batch["pixels_embed"][:, :num_steps].float()
+        if "object_slots" in batch:
+            object_slots = batch["object_slots"][:, :num_steps].float()
             proprio_slots = self.world_model.proprio_encoder(proprio.float()).unsqueeze(
                 2
             )
@@ -137,7 +137,11 @@ class CJepaBackbone(nn.Module):
         return info["embed"]
 
     def forward(self, x):
-        """Use ceil((L-H)/P)+1 predictor calls and return P final frames."""
+        """Collect the full rollout trace ``(B, R, P, S+2, D)`` over all rounds.
+
+        ``R = ceil((L-H)/P)+1`` predictor calls. Each round's raw prediction is
+        collected before its action slot is overwritten for the next round.
+        """
         h, p = self.history_size, self.predicted_size
         actions = x["action"]
         history = self.encode_inputs(x, h)
@@ -145,10 +149,12 @@ class CJepaBackbone(nn.Module):
         predictor = self.world_model.predictor
         saved_num_masked_slots = predictor.num_masked_slots
         predictor.num_masked_slots = 0
+        trace = []
         try:
             current_step = h
             while current_step < actions.shape[1]:
                 future = self.world_model.predict(history)[0][:, h : h + p]
+                trace.append(future)
                 steps_this_round = min(p, actions.shape[1] - current_step)
                 future = self.world_model.replace_action_in_embedding(
                     future[:, :steps_this_round].unsqueeze(1),
@@ -159,10 +165,10 @@ class CJepaBackbone(nn.Module):
                 history = torch.cat([history, future], dim=1)[:, -h:]
                 current_step += steps_this_round
 
-            future = self.world_model.predict(history)[0][:, h : h + p]
+            trace.append(self.world_model.predict(history)[0][:, h : h + p])
         finally:
             predictor.num_masked_slots = saved_num_masked_slots
-        return future
+        return torch.stack(trace, dim=1)
 
     def anchor_loss(self, batch):
         """Compute the masked-history and future-state anchor loss."""

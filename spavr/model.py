@@ -27,6 +27,7 @@ class RewardRiskModel(nn.Module):
         self.head = QuantileHead(
             self.backbone.slot_dim,
             self.backbone.num_objects,
+            predicted_size,
             hidden_dim,
             taus,
         )
@@ -36,7 +37,7 @@ class RewardRiskModel(nn.Module):
 
         ``pixels`` and ``proprio`` contain state history. ``action`` contains the
         complete future sequence ``(B, L, action_input_dim)``. The backbone rolls
-        over all L actions and returns P post-action future frames.
+        over all L actions and returns the full rollout trace ``(B, R, P, S+2, D)``.
         """
-        z_future = self.backbone(x)
-        return self.head(z_future)
+        rollout_trace = self.backbone(x)
+        return self.head(rollout_trace)
