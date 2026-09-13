@@ -1,0 +1,12 @@
+seed: 42
+data_root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test
+# The staged training route ends at this checkpoint. Override with
+# --checkpoint only when intentionally comparing an earlier stage.
+checkpoint: /data7/yuqingchi/Code/SPAVR/outputs/videosaur_multistage/stage3_final_refine_s6_t005/best.pt
+output_root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test/object_slots/videosaur_dinov2_s14_s6
+splits: [train, val, test]
+device: auto
+amp: true
+frame_batch_size: 16
+storage_dtype: float16
+visualization_examples: 8

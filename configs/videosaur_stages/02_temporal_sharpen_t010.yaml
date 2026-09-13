@@ -1,0 +1,47 @@
+seed: 42
+
+# Stage 2/3: sharpen temporal correspondence while retaining all six slots.
+# Loading through initialization intentionally starts a fresh optimizer/scheduler.
+initialization:
+  checkpoint: /data7/yuqingchi/Code/SPAVR/outputs/videosaur_multistage/stage1_domain_adapt_s6_t025/best.pt
+
+data:
+  root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test
+  clip_length: 6
+  frame_stride: 2
+  clip_step: 1
+  horizontal_flip_probability: 0.5
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+model:
+  dino_model: facebook/dinov2-small
+  image_size: 196
+  patch_size: 14
+  feature_dim: 384
+  num_slots: 6
+  slot_dim: 128
+
+loss:
+  feature_reconstruction_weight: 1.0
+  time_similarity_weight: 0.25
+  time_similarity_temperature: 0.10
+
+optim:
+  learning_rate: 2.5e-5
+  weight_decay: 0.0
+  warmup_steps: 250
+  decay_rate: 0.35
+
+training:
+  device: auto
+  amp: true
+  max_steps: 15000
+  gradient_accumulation_steps: 1
+  gradient_clip_norm: 0.05
+  val_every_steps: 500
+  max_val_batches: 20
+  visualize_every_steps: 500
+  checkpoint_every_steps: 2500
+  output_dir: outputs/videosaur_multistage/stage2_temporal_sharpen_s6_t010

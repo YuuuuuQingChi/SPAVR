@@ -1,0 +1,47 @@
+seed: 42
+
+# Stage 1/3: adapt the released Push-T VideoSAUR to SPAVR appearance with six slots.
+# The relatively soft temporal target keeps this first transfer stage stable.
+initialization:
+  checkpoint: /data7/yuqingchi/Code/SPAVR/checkpoints/pusht_videosaur_model.ckpt
+
+data:
+  root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test
+  clip_length: 6
+  frame_stride: 2
+  clip_step: 1
+  horizontal_flip_probability: 0.5
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+
+model:
+  dino_model: facebook/dinov2-small
+  image_size: 196
+  patch_size: 14
+  feature_dim: 384
+  num_slots: 6
+  slot_dim: 128
+
+loss:
+  feature_reconstruction_weight: 1.0
+  time_similarity_weight: 0.25
+  time_similarity_temperature: 0.25
+
+optim:
+  learning_rate: 5.0e-5
+  weight_decay: 0.0
+  warmup_steps: 500
+  decay_rate: 0.5
+
+training:
+  device: auto
+  amp: true
+  max_steps: 20000
+  gradient_accumulation_steps: 1
+  gradient_clip_norm: 0.05
+  val_every_steps: 500
+  max_val_batches: 20
+  visualize_every_steps: 500
+  checkpoint_every_steps: 2500
+  output_dir: outputs/videosaur_multistage/stage1_domain_adapt_s6_t025

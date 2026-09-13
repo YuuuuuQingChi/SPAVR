@@ -29,7 +29,7 @@ predictor 调用次数: ceil((L-H)/P)+1
 - predictor 每轮通过官方 `CausalWM_AP.predict()` 生成 P 个未来位置；剩余动作每次最多取 P 个，经 `replace_action_in_embedding()` 写入对应预测位置，再随预测状态进入下一轮 history。
 - proprio 同样通过官方 `encode(..., proprio_key="proprio")` 加入，槽顺序始终是对象、proprio、action。
 - 模型消费完整长度 L 的动作序列；动作耗尽后额外预测一次完整 P 帧，作为奖励头的输入。
-- **mask 永不碰 proprio / action 槽**：`MaskedSlot_AP_Predictor.get_mask_indices` 用 `rng.choice(num_slots-2, ...)`，只在前 S 个对象槽里选，loss 也只在对象槽上算。
+- **mask 永不碰 proprio / action 槽**：SPAVR 的 predictor 每次 forward 从前 S 个对象槽中重新随机选择，loss 也只在对象槽上计算。
 
 **结论：predictor 内部的未来 query 能通过 full attention 看到当前 H 帧 history 中的动作 token。后续动作在本轮预测完成后写入预测状态，并在下一轮 predictor 中生效；完整序列耗尽后额外预测的 P 帧用于奖励评分，因此所有输入动作都有通向输出的计算路径。**
 
@@ -55,7 +55,7 @@ predictor 调用次数: ceil((L-H)/P)+1
 
 **动作接口契约**：`x["action"]` 只表示尚未执行的完整未来动作序列。前 H 个交给官方 `encode`；其余动作按每轮最多 P 个交给官方 `replace_action_in_embedding` 并滚入下一轮 history。模型不截断动作，predictor 调用次数为 `ceil((L-H)/P)+1`；代码不额外编写尺寸检查。
 
-SPAVR 不修改第三方 C-JEPA：`spavr/backbone.py` 在外层复用 `CausalWM_AP`，`spavr/heads.py` 单独定义分位数头。Frozen 与 Predictor 分别由 `train/train_frozen.py + configs/frozen.yaml` 和 `train/train_finetune_predictor.py + configs/finetune_predictor.yaml` 驱动，共享的 Stable-Pretraining 逻辑位于 `train/common.py`。
+SPAVR 不修改第三方 C-JEPA：`spavr/backbone.py` 在外层复用 `CausalWM_AP` 并修正 object mask 采样，`spavr/heads.py` 单独定义分位数头。统一训练入口为 `train/train.py`，通过 `configs/spavr_stages/` 中的三个配置依次执行 dynamics、quantile-head 和 joint-finetune。
 
 ## 共用数据底座（三方案的共同前提）
 

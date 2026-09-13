@@ -91,24 +91,23 @@ object_slots: (B,T,S,D)
 
 评分时 `T=H`；计算 anchor loss 时训练 batch 需要 `T=H+P`。预抽取 slots 必须来自与模型一致的 VideoSAUR 权重和 slot 配置。当前代码在 batch 含 `object_slots` 时优先使用该路径，否则读取 `pixels`。
 
-模型中的当前数值状态统一定义为机械臂在当前时刻的实际末端位姿：
+模型中的当前数值状态是 7 维 proprio：
 
 ```text
-state_t = pose_t^ee
+proprio_t = [pose_t^ee, gripper_(t-1)]
 ```
 
-其中包含末端实际位置和实际姿态，不使用关节角、关节速度或关节力矩作为该状态的定义。视觉 pixels / slots 仍然表示外部场景观测。
+前 6 维是末端实际位置和 rotation vector，第 7 维是动作执行前的夹爪状态。不使用关节角、关节速度或关节力矩。视觉 pixels / slots 表示外部场景观测。
 
 当前代码没有独立的 goal / instruction encoder，任务目标只能通过图像或 slots 进入模型。
 
 ### 2.3 动作条件化 rollout
 
 ```python
-action: (B,L,A_in)                 # 末端期望位姿增量序列
-A_in = frameskip * action_dim      # 一个模型 action block 的宽度
+action: (B,L,7)  # 6 维末端位姿增量 + 1 维夹爪命令
 ```
 
-当 `frameskip>1` 时，一个 action block 是连续多个末端位姿增量的展平结果。所有 action 经过同一个 `action_encoder` 映射到维度 `D`。
+每个 action 对应一个重采样后的时间步，经过 `action_encoder` 映射到维度 `D`。
 
 ```python
 history = concat(
@@ -193,15 +192,14 @@ q10 <= q50 <= q90
 ```python
 episode = {
     "pixels_or_slots": ...,
-    "state": ...,         # 当前末端实际位姿
-    "proprio": ...,       # 可包含 state 及其他本体信息
-    "action": ...,        # 末端期望位姿增量
+    "proprio": ...,       # 6 维末端位姿 + 上一时刻夹爪状态
+    "action": ...,        # 6 维末端位姿增量 + 夹爪命令
     "reward": ...,        # 每个控制时刻的奖励
     "goal": ...,
 }
 ```
 
-必须统一时间语义：`state[t]` 是时刻 `t` 的末端实际位姿，`action[t]` 是基于该位姿下发的末端期望位姿增量，`reward[t]` 是执行 `action[t]` 后得到的回报。
+必须统一时间语义：`proprio[t]` 和外部图像是动作执行前的观测，`action[t]` 是基于该观测下发的 7 维动作，`reward[t]` 是执行该动作后得到的回报。三者时间长度相同。
 
 ### 4.2 回报标签
 
@@ -286,20 +284,31 @@ loss_anchor = loss_masked_history
 
 ## 6. 训练策略
 
-### Frozen
+### 3A Dynamics
 
 ```text
-冻结 C-JEPA backbone
-训练 full-trace quantile head
+冻结 VideoSAUR、预抽取 object slots 和 quantile head
+训练 predictor、action encoder 和 proprio encoder
 ```
 
-该策略用于先验证未来 latent 中是否存在可读出的回报和风险信号。
+每个 episode 内以 `stride=1` 使用全部 `H→P` 合法窗口。损失权重为 future-object `1.0`、future-proprio `0.5`、masked-history `0.1`，最佳 checkpoint 按前两项加权后的 validation loss 选择。
 
-### Finetune Predictor
+### 3B Quantile Head
 
 ```text
-冻结视觉 encoder / initializer / slot attention
-训练 predictor / action encoder / proprio encoder / 输出头
+加载 3A best.pt
+冻结完整 dynamics
+只训练 full-trace quantile head
 ```
 
-联合使用分位数损失和单轮 anchor loss 训练 predictor、action encoder、proprio encoder 与输出头。
+仅使用 quantile loss，最佳 checkpoint 按 validation quantile loss 选择。
+
+### 3C Joint Finetune
+
+```text
+加载 3B best.pt
+继续冻结 VideoSAUR 和 object slots
+联合训练 dynamics 与 quantile head
+```
+
+head 使用 `1e-4`，dynamics 使用 `1e-5`。损失权重为 quantile `1.0`、future-object `0.1`、future-proprio `0.05`、masked-history `0.01`。阶段切换重新创建 optimizer/scheduler，`--resume` 只用于同一阶段的中断恢复。

@@ -1,0 +1,57 @@
+# Stage 3C: low-LR joint refinement with a 10x predictor/head LR ratio.
+seed: 42
+
+data:
+  root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test
+  object_slots_root: /data7/yuqingchi/Code/SPAVR/processed_spavr_test/object_slots/videosaur_dinov2_s14_s6
+  history_size: 3
+  predicted_size: 2
+  action_horizon: 5
+  reward_gamma: 1.0
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+
+model:
+  visual_input_mode: object_slots
+  num_objects: 6
+  slot_dim: 128
+  num_masked_slots: 1
+  depth: 6
+  heads: 16
+  dim_head: 64
+  mlp_dim: 2048
+  dropout: 0.1
+  hidden_dim: 256
+  taus: [0.1, 0.5, 0.9]
+
+loss:
+  quantile_weight: 1.0
+  future_object_weight: 0.1
+  future_proprio_weight: 0.05
+  masked_history_weight: 0.01
+
+optim:
+  head_learning_rate: 1.0e-4
+  dynamics_learning_rate: 1.0e-5
+  weight_decay: 1.0e-4
+
+training:
+  stage: joint
+  init_checkpoint: outputs/spavr_multistage/stage3b_quantile_head_h3_p2_l5_s6/best.pt
+  require_init_checkpoint: true
+  device: auto
+  amp: true
+  gradient_clip_norm: 1.0
+  epochs: 15
+  warmup_epochs: 1
+  warmup_start_factor: 0.1
+  early_stopping_patience: 5
+  selection_metric: loss_quantile
+  output_dir: outputs/spavr_multistage/stage3c_joint_h3_p2_l5_s6
+
+logging:
+  backend: tensorboard
+  log_every_steps: 20
+  visualize_every_epochs: 1
+  visualization_examples: 4

@@ -16,6 +16,8 @@ data/
 outputs/
 checkpoints/
 wandb/
-
+docs/
+processed_spavr_test
 # OS / editor cruft
 .DS_Store
+uv.lock
